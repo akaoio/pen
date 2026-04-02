@@ -1,0 +1,792 @@
+// pen.zig — PEN Core VM
+// ISA v1, environment-agnostic, no stdlib dependency.
+// Compiles to freestanding wasm32 with zero imports.
+//
+// Opcodes:
+//   0x00 NULL    0x01 TRUE   0x02 FALSE
+//   0x03 STR     0x04 UINT(uleb128) 0x07 INT(sleb128) 0x08 F64
+//   0x10 REG(n)
+//   0x20 AND(n)  0x21 OR(n)  0x22 NOT  0x23 PASS  0x24 FAIL
+//   0x30 EQ  0x31 NE  0x32 LT  0x33 GT  0x34 LTE  0x35 GTE
+//   0x40 ADD 0x41 SUB 0x42 MUL 0x43 DIVU 0x44 MOD 0x45 DIVF 0x46 ABS 0x47 NEG
+//   0x50 LEN 0x51 SLICE 0x52 SEG 0x53 TONUM 0x54 TOSTR
+//   0x55 CONCAT 0x56 PRE 0x57 SUF 0x58 INCLUDES 0x59 REGEX 0x5A UPPER 0x5B LOWER
+//   0x60 ISS 0x61 ISN 0x62 ISX 0x63 ISB 0x64 LNG
+//   0x70 LET(n, def, body)  0x71 IF(cond, then, else)
+//   0x80 SEGR(reg, sep, idx)  0x81 SEGRN(reg, sep, idx)
+//   0xE0..0xEF = inline uint 0..15
+//   0xF0..0xF5 = REG(0)..REG(5) shorthands
+//   0xF8..0xFB = local[0]..local[3] shorthands
+
+const MAX_DEPTH: u32 = 32;
+const MAX_LOCALS: usize = 32;
+const MAX_REGS: usize = 64;
+const MAX_STR: usize = 128;
+
+// Value tag
+const TAG_NULL: u8 = 0;
+const TAG_BOOL: u8 = 1;
+const TAG_INT: u8 = 2;
+const TAG_FLOAT: u8 = 3;
+const TAG_STR: u8 = 4;
+const TAG_ERR: u8 = 5;
+
+pub const Value = struct {
+    tag: u8,
+    i: i64, // TAG_INT or TAG_BOOL (0/1) or TAG_ERR code
+    f: f64, // TAG_FLOAT
+    s: [MAX_STR]u8, // TAG_STR
+    slen: u16,
+};
+
+pub fn vNull() Value {
+    var v: Value = undefined;
+    v.tag = TAG_NULL;
+    v.i = 0;
+    v.f = 0;
+    v.slen = 0;
+    return v;
+}
+pub fn vBool(b: bool) Value {
+    var v: Value = undefined;
+    v.tag = TAG_BOOL;
+    v.i = if (b) 1 else 0;
+    v.f = 0;
+    v.slen = 0;
+    return v;
+}
+pub fn vInt(n: i64) Value {
+    var v: Value = undefined;
+    v.tag = TAG_INT;
+    v.i = n;
+    v.f = 0;
+    v.slen = 0;
+    return v;
+}
+pub fn vFloat(f: f64) Value {
+    var v: Value = undefined;
+    v.tag = TAG_FLOAT;
+    v.i = 0;
+    v.f = f;
+    v.slen = 0;
+    return v;
+}
+pub fn vStr(ptr: [*]const u8, len: usize) Value {
+    var v: Value = undefined;
+    v.tag = TAG_STR;
+    v.i = 0;
+    v.f = 0;
+    const l = if (len > MAX_STR) MAX_STR else len;
+    v.slen = @intCast(l);
+    var i: usize = 0;
+    while (i < l) : (i += 1) v.s[i] = ptr[i];
+    return v;
+}
+fn vStrSlice(sl: []const u8) Value {
+    return vStr(sl.ptr, sl.len);
+}
+pub fn vErr(code: i64) Value {
+    var v: Value = undefined;
+    v.tag = TAG_ERR;
+    v.i = code;
+    v.f = 0;
+    v.slen = 0;
+    return v;
+}
+
+fn isTruthy(v: Value) bool {
+    return switch (v.tag) {
+        TAG_NULL => false,
+        TAG_BOOL => v.i != 0,
+        TAG_INT => v.i != 0,
+        TAG_FLOAT => v.f != 0.0,
+        TAG_STR => v.slen > 0,
+        else => false,
+    };
+}
+
+fn toNumber(v: Value) f64 {
+    return switch (v.tag) {
+        TAG_INT => @floatFromInt(v.i),
+        TAG_FLOAT => v.f,
+        TAG_BOOL => @floatFromInt(v.i),
+        TAG_STR => parseF64(v.s[0..v.slen]),
+        else => 0.0,
+    };
+}
+
+fn valEqual(a: Value, b: Value) bool {
+    if (a.tag == TAG_NULL and b.tag == TAG_NULL) return true;
+    if (a.tag == TAG_NULL or b.tag == TAG_NULL) return false;
+    if (a.tag == TAG_STR and b.tag == TAG_STR) {
+        if (a.slen != b.slen) return false;
+        var i: usize = 0;
+        while (i < a.slen) : (i += 1) {
+            if (a.s[i] != b.s[i]) return false;
+        }
+        return true;
+    }
+    // numeric compare
+    return toNumber(a) == toNumber(b);
+}
+
+fn strCmp(a: Value, b: Value) i32 {
+    // lexicographic for strings, numeric for others
+    if (a.tag == TAG_STR and b.tag == TAG_STR) {
+        const la = a.slen;
+        const lb = b.slen;
+        const min = if (la < lb) la else lb;
+        var i: usize = 0;
+        while (i < min) : (i += 1) {
+            if (a.s[i] < b.s[i]) return -1;
+            if (a.s[i] > b.s[i]) return 1;
+        }
+        if (la < lb) return -1;
+        if (la > lb) return 1;
+        return 0;
+    }
+    const an = toNumber(a);
+    const bn = toNumber(b);
+    if (an < bn) return -1;
+    if (an > bn) return 1;
+    return 0;
+}
+
+// Simple float parser (no libc)
+fn parseF64(s: []const u8) f64 {
+    var r: f64 = 0;
+    var dec: f64 = 0;
+    var neg = false;
+    var i: usize = 0;
+    if (i < s.len and s[i] == '-') {
+        neg = true;
+        i += 1;
+    }
+    while (i < s.len and s[i] >= '0' and s[i] <= '9') : (i += 1) {
+        r = r * 10.0 + @as(f64, @floatFromInt(s[i] - '0'));
+    }
+    if (i < s.len and s[i] == '.') {
+        i += 1;
+        dec = 0.1;
+        while (i < s.len and s[i] >= '0' and s[i] <= '9') : (i += 1) {
+            r += @as(f64, @floatFromInt(s[i] - '0')) * dec;
+            dec *= 0.1;
+        }
+    }
+    return if (neg) -r else r;
+}
+
+// f64 to string (simplified, enough for test output)
+fn f64ToStr(f: f64, buf: []u8) usize {
+    // Handle special cases
+    if (f != f) { // NaN
+        buf[0] = 'N';
+        buf[1] = 'a';
+        buf[2] = 'N';
+        return 3;
+    }
+    var val = f;
+    var pos: usize = 0;
+    if (val < 0) {
+        buf[pos] = '-';
+        pos += 1;
+        val = -val;
+    }
+    // Integer part
+    const ipart: i64 = @intFromFloat(val);
+    const fpart: f64 = val - @as(f64, @floatFromInt(ipart));
+    // Write integer part
+    if (ipart == 0) {
+        buf[pos] = '0';
+        pos += 1;
+    } else {
+        var tmp: [20]u8 = undefined;
+        var tlen: usize = 0;
+        var n = ipart;
+        while (n > 0) : (n = @divTrunc(n, 10)) {
+            tmp[tlen] = @intCast(@mod(n, 10) + '0');
+            tlen += 1;
+        }
+        var j: usize = tlen;
+        while (j > 0) : (j -= 1) {
+            buf[pos] = tmp[j - 1];
+            pos += 1;
+        }
+    }
+    // Decimal part (up to 6 places, trim trailing zeros)
+    if (fpart > 0.000001) {
+        buf[pos] = '.';
+        pos += 1;
+        var fp = fpart;
+        var places: usize = 0;
+        var decbuf: [6]u8 = undefined;
+        while (places < 6) : (places += 1) {
+            fp *= 10.0;
+            const d: u8 = @intCast(@as(i64, @intFromFloat(fp)));
+            decbuf[places] = d + '0';
+            fp -= @as(f64, @floatFromInt(d));
+        }
+        // trim trailing zeros
+        var dlen: usize = 6;
+        while (dlen > 1 and decbuf[dlen - 1] == '0') dlen -= 1;
+        var k: usize = 0;
+        while (k < dlen) : (k += 1) {
+            buf[pos] = decbuf[k];
+            pos += 1;
+        }
+    }
+    return pos;
+}
+
+fn intToStr(n: i64, buf: []u8) usize {
+    if (n == 0) {
+        buf[0] = '0';
+        return 1;
+    }
+    var tmp: [20]u8 = undefined;
+    var tlen: usize = 0;
+    var pos: usize = 0;
+    var neg = false;
+    var v = n;
+    if (v < 0) {
+        neg = true;
+        v = -v;
+    }
+    while (v > 0) : (v = @divTrunc(v, 10)) {
+        tmp[tlen] = @intCast(@mod(v, 10) + '0');
+        tlen += 1;
+    }
+    if (neg) {
+        buf[pos] = '-';
+        pos += 1;
+    }
+    var j: usize = tlen;
+    while (j > 0) : (j -= 1) {
+        buf[pos] = tmp[j - 1];
+        pos += 1;
+    }
+    return pos;
+}
+
+// startsWith
+fn strStartsWith(s: Value, prefix: Value) bool {
+    if (s.tag != TAG_STR or prefix.tag != TAG_STR) return false;
+    if (prefix.slen > s.slen) return false;
+    var i: usize = 0;
+    while (i < prefix.slen) : (i += 1) {
+        if (s.s[i] != prefix.s[i]) return false;
+    }
+    return true;
+}
+
+// endsWith
+fn strEndsWith(s: Value, suffix: Value) bool {
+    if (s.tag != TAG_STR or suffix.tag != TAG_STR) return false;
+    if (suffix.slen > s.slen) return false;
+    const offset = s.slen - suffix.slen;
+    var i: usize = 0;
+    while (i < suffix.slen) : (i += 1) {
+        if (s.s[offset + i] != suffix.s[i]) return false;
+    }
+    return true;
+}
+
+// includes
+fn strIncludes(s: Value, needle: Value) bool {
+    if (s.tag != TAG_STR or needle.tag != TAG_STR) return false;
+    if (needle.slen == 0) return true;
+    if (needle.slen > s.slen) return false;
+    const limit = s.slen - needle.slen;
+    var i: usize = 0;
+    while (i <= limit) : (i += 1) {
+        var match = true;
+        var j: usize = 0;
+        while (j < needle.slen) : (j += 1) {
+            if (s.s[i + j] != needle.s[j]) {
+                match = false;
+                break;
+            }
+        }
+        if (match) return true;
+    }
+    return false;
+}
+
+// lower/upper
+fn strToLower(v: Value) Value {
+    if (v.tag != TAG_STR) return v;
+    var r = v;
+    var i: usize = 0;
+    while (i < r.slen) : (i += 1) {
+        if (r.s[i] >= 'A' and r.s[i] <= 'Z') r.s[i] += 32;
+    }
+    return r;
+}
+fn strToUpper(v: Value) Value {
+    if (v.tag != TAG_STR) return v;
+    var r = v;
+    var i: usize = 0;
+    while (i < r.slen) : (i += 1) {
+        if (r.s[i] >= 'a' and r.s[i] <= 'z') r.s[i] -= 32;
+    }
+    return r;
+}
+
+// SEG(str, sep_byte, idx) → split str by sep, return segment at idx
+fn strSeg(s: Value, sep: u8, idx: i64) Value {
+    if (s.tag != TAG_STR) return vStr("", 0);
+    var seg_idx: i64 = 0;
+    var seg_start: usize = 0;
+    var i: usize = 0;
+    while (i <= s.slen) : (i += 1) {
+        const at_sep = (i == s.slen or s.s[i] == sep);
+        if (at_sep) {
+            if (seg_idx == idx) {
+                return vStrSlice(s.s[seg_start..i]);
+            }
+            seg_idx += 1;
+            seg_start = i + 1;
+        }
+    }
+    return vStr("", 0);
+}
+
+// ULEB128 read
+fn readUleb(bc: []const u8, pos: *usize) u64 {
+    var result: u64 = 0;
+    var shift: u6 = 0;
+    while (pos.* < bc.len) {
+        const b = bc[pos.*];
+        pos.* += 1;
+        result |= @as(u64, b & 0x7F) << shift;
+        if ((b & 0x80) == 0) break;
+        shift += 7;
+    }
+    return result;
+}
+
+// SLEB128 read
+fn readSleb(bc: []const u8, pos: *usize) i64 {
+    var result: i64 = 0;
+    var shift: u6 = 0;
+    var b: u8 = 0;
+    while (pos.* < bc.len) {
+        b = bc[pos.*];
+        pos.* += 1;
+        result |= @as(i64, b & 0x7F) << shift;
+        shift += 7;
+        if ((b & 0x80) == 0) break;
+    }
+    if (shift < 64 and (b & 0x40) != 0) {
+        result |= -(@as(i64, 1) << shift);
+    }
+    return result;
+}
+
+pub const EvalError = error{
+    BadVersion,
+    UnknownOpcode,
+    OutOfBounds,
+    MaxDepth,
+    DivisionByZero,
+    BadBytecode,
+};
+
+pub const Ctx = struct {
+    bc: []const u8,
+    regs: []const Value,
+    locals: [MAX_LOCALS]Value,
+    depth: u32,
+};
+
+pub fn eval(ctx: *Ctx, pos: *usize) EvalError!Value {
+    if (ctx.depth >= MAX_DEPTH) return EvalError.MaxDepth;
+    if (pos.* >= ctx.bc.len) return EvalError.OutOfBounds;
+
+    ctx.depth += 1;
+    defer ctx.depth -= 1;
+
+    const op = ctx.bc[pos.*];
+    pos.* += 1;
+
+    // Inline integer shortcuts 0xE0..0xEF = 0..15
+    if (op >= 0xE0 and op <= 0xEF) return vInt(op - 0xE0);
+
+    // Register shorthands
+    if (op >= 0xF0 and op <= 0xF5) {
+        const n = op - 0xF0;
+        if (n >= ctx.regs.len) return vNull();
+        return ctx.regs[n];
+    }
+    if (op >= 0xF8 and op <= 0xFB) {
+        return ctx.locals[op - 0xF8];
+    }
+
+    switch (op) {
+        0x00 => return vNull(),
+        0x01 => return vBool(true),
+        0x02 => return vBool(false),
+
+        // STR: 0x03 [u8 len] [utf8...]
+        0x03 => {
+            if (pos.* >= ctx.bc.len) return EvalError.BadBytecode;
+            const len = ctx.bc[pos.*];
+            pos.* += 1;
+            if (pos.* + len > ctx.bc.len) return EvalError.BadBytecode;
+            const start = pos.*;
+            pos.* += len;
+            return vStr(ctx.bc[start..].ptr, len);
+        },
+
+        // UINT (ULEB128)
+        0x04 => return vInt(@intCast(readUleb(ctx.bc, pos))),
+
+        // INT (SLEB128)
+        0x07 => return vInt(readSleb(ctx.bc, pos)),
+
+        // F64 big-endian
+        0x08 => {
+            if (pos.* + 8 > ctx.bc.len) return EvalError.BadBytecode;
+            var bytes: [8]u8 = undefined;
+            var k: usize = 0;
+            while (k < 8) : (k += 1) {
+                bytes[k] = ctx.bc[pos.*];
+                pos.* += 1;
+            }
+            const bits = (@as(u64, bytes[0]) << 56) | (@as(u64, bytes[1]) << 48) |
+                (@as(u64, bytes[2]) << 40) | (@as(u64, bytes[3]) << 32) |
+                (@as(u64, bytes[4]) << 24) | (@as(u64, bytes[5]) << 16) |
+                (@as(u64, bytes[6]) << 8) | @as(u64, bytes[7]);
+            return vFloat(@bitCast(bits));
+        },
+
+        // REG(n)
+        0x10 => {
+            if (pos.* >= ctx.bc.len) return EvalError.BadBytecode;
+            const n = ctx.bc[pos.*];
+            pos.* += 1;
+            if (n >= 128) return ctx.locals[n - 128];
+            if (n >= ctx.regs.len) return vNull();
+            return ctx.regs[n];
+        },
+
+        // AND(n)
+        0x20 => {
+            if (pos.* >= ctx.bc.len) return EvalError.BadBytecode;
+            const n = ctx.bc[pos.*];
+            pos.* += 1;
+            var ok = true;
+            var i: u8 = 0;
+            while (i < n) : (i += 1) {
+                const v = try eval(ctx, pos);
+                if (!isTruthy(v)) ok = false;
+            }
+            return vBool(ok);
+        },
+
+        // OR(n)
+        0x21 => {
+            if (pos.* >= ctx.bc.len) return EvalError.BadBytecode;
+            const n = ctx.bc[pos.*];
+            pos.* += 1;
+            var ok = false;
+            var i: u8 = 0;
+            while (i < n) : (i += 1) {
+                const v = try eval(ctx, pos);
+                if (isTruthy(v)) ok = true;
+            }
+            return vBool(ok);
+        },
+
+        0x22 => { // NOT
+            const v = try eval(ctx, pos);
+            return vBool(!isTruthy(v));
+        },
+        0x23 => return vBool(true), // PASS
+        0x24 => return vBool(false), // FAIL
+
+        // Comparison
+        0x30 => {
+            const a = try eval(ctx, pos);
+            const b = try eval(ctx, pos);
+            return vBool(valEqual(a, b));
+        },
+        0x31 => {
+            const a = try eval(ctx, pos);
+            const b = try eval(ctx, pos);
+            return vBool(!valEqual(a, b));
+        },
+        0x32 => {
+            const a = try eval(ctx, pos);
+            const b = try eval(ctx, pos);
+            return vBool(strCmp(a, b) < 0);
+        },
+        0x33 => {
+            const a = try eval(ctx, pos);
+            const b = try eval(ctx, pos);
+            return vBool(strCmp(a, b) > 0);
+        },
+        0x34 => {
+            const a = try eval(ctx, pos);
+            const b = try eval(ctx, pos);
+            return vBool(strCmp(a, b) <= 0);
+        },
+        0x35 => {
+            const a = try eval(ctx, pos);
+            const b = try eval(ctx, pos);
+            return vBool(strCmp(a, b) >= 0);
+        },
+
+        // Arithmetic
+        0x40 => { // ADD
+            const a = try eval(ctx, pos);
+            const b = try eval(ctx, pos);
+            if (a.tag == TAG_INT and b.tag == TAG_INT) return vInt(a.i + b.i);
+            return vFloat(toNumber(a) + toNumber(b));
+        },
+        0x41 => { // SUB
+            const a = try eval(ctx, pos);
+            const b = try eval(ctx, pos);
+            if (a.tag == TAG_INT and b.tag == TAG_INT) return vInt(a.i - b.i);
+            return vFloat(toNumber(a) - toNumber(b));
+        },
+        0x42 => { // MUL
+            const a = try eval(ctx, pos);
+            const b = try eval(ctx, pos);
+            if (a.tag == TAG_INT and b.tag == TAG_INT) return vInt(a.i * b.i);
+            return vFloat(toNumber(a) * toNumber(b));
+        },
+        0x43 => { // DIVU — floor division
+            const a = try eval(ctx, pos);
+            const b = try eval(ctx, pos);
+            const bn = toNumber(b);
+            if (bn == 0) return EvalError.DivisionByZero;
+            if (a.tag == TAG_INT and b.tag == TAG_INT) {
+                if (b.i == 0) return EvalError.DivisionByZero;
+                return vInt(@divFloor(a.i, b.i));
+            }
+            return vFloat(@floor(toNumber(a) / bn));
+        },
+        0x44 => { // MOD
+            const a = try eval(ctx, pos);
+            const b = try eval(ctx, pos);
+            if (a.tag == TAG_INT and b.tag == TAG_INT) {
+                if (b.i == 0) return EvalError.DivisionByZero;
+                return vInt(@mod(a.i, b.i));
+            }
+            return vFloat(@mod(toNumber(a), toNumber(b)));
+        },
+        0x45 => { // DIVF
+            const a = try eval(ctx, pos);
+            const b = try eval(ctx, pos);
+            return vFloat(toNumber(a) / toNumber(b));
+        },
+        0x46 => { // ABS
+            const a = try eval(ctx, pos);
+            if (a.tag == TAG_INT) return vInt(if (a.i < 0) -a.i else a.i);
+            return vFloat(@abs(toNumber(a)));
+        },
+        0x47 => { // NEG
+            const a = try eval(ctx, pos);
+            if (a.tag == TAG_INT) return vInt(-a.i);
+            return vFloat(-toNumber(a));
+        },
+
+        // String ops
+        0x50 => { // LEN
+            const a = try eval(ctx, pos);
+            const l: i64 = if (a.tag == TAG_STR) a.slen else 0;
+            return vInt(l);
+        },
+        0x51 => { // SLICE(str, start, end)
+            const s = try eval(ctx, pos);
+            const st_v = try eval(ctx, pos);
+            const en_v = try eval(ctx, pos);
+            if (s.tag != TAG_STR) return vStr("", 0);
+            var st: usize = @intCast(@max(0, @as(i64, @intFromFloat(toNumber(st_v)))));
+            var en: usize = @intCast(@max(0, @as(i64, @intFromFloat(toNumber(en_v)))));
+            if (st > s.slen) st = s.slen;
+            if (en > s.slen) en = s.slen;
+            if (st > en) st = en;
+            return vStr(s.s[st..].ptr, en - st);
+        },
+        0x52 => { // SEG(str_expr, sep_byte, idx_expr)
+            const s = try eval(ctx, pos);
+            if (pos.* >= ctx.bc.len) return EvalError.BadBytecode;
+            const sep = ctx.bc[pos.*];
+            pos.* += 1;
+            const idx_v = try eval(ctx, pos);
+            const idx: i64 = @intFromFloat(toNumber(idx_v));
+            return strSeg(s, sep, idx);
+        },
+        0x53 => { // TONUM
+            const a = try eval(ctx, pos);
+            if (a.tag == TAG_INT) return a;
+            if (a.tag == TAG_FLOAT) return a;
+            if (a.tag == TAG_STR) return vFloat(parseF64(a.s[0..a.slen]));
+            return vInt(0);
+        },
+        0x54 => { // TOSTR
+            const a = try eval(ctx, pos);
+            switch (a.tag) {
+                TAG_STR => return a,
+                TAG_INT => {
+                    var buf: [32]u8 = undefined;
+                    const l = intToStr(a.i, &buf);
+                    return vStr(&buf, l);
+                },
+                TAG_FLOAT => {
+                    var buf: [32]u8 = undefined;
+                    const l = f64ToStr(a.f, &buf);
+                    return vStr(&buf, l);
+                },
+                TAG_BOOL => return if (a.i != 0) vStr("true", 4) else vStr("false", 5),
+                else => return vStr("null", 4),
+            }
+        },
+        0x55 => { // CONCAT
+            const a = try eval(ctx, pos);
+            const b = try eval(ctx, pos);
+            if (a.tag == TAG_STR and b.tag == TAG_STR) {
+                var r: Value = undefined;
+                r.tag = TAG_STR;
+                r.i = 0;
+                r.f = 0;
+                const total = @min(a.slen + b.slen, MAX_STR);
+                var k: usize = 0;
+                while (k < a.slen and k < total) : (k += 1) r.s[k] = a.s[k];
+                var j: usize = 0;
+                while (j < b.slen and k + j < total) : (j += 1) r.s[k + j] = b.s[j];
+                r.slen = @intCast(total);
+                return r;
+            }
+            return vStr("", 0);
+        },
+        0x56 => {
+            const a = try eval(ctx, pos);
+            const b = try eval(ctx, pos);
+            return vBool(strStartsWith(a, b));
+        }, // PRE
+        0x57 => {
+            const a = try eval(ctx, pos);
+            const b = try eval(ctx, pos);
+            return vBool(strEndsWith(a, b));
+        }, // SUF
+        0x58 => {
+            const a = try eval(ctx, pos);
+            const b = try eval(ctx, pos);
+            return vBool(strIncludes(a, b));
+        }, // INCLUDES
+        0x59 => { // REGEX — not implemented in core (host extension), return false
+            _ = try eval(ctx, pos);
+            _ = try eval(ctx, pos);
+            return vBool(false);
+        },
+        0x5A => {
+            const a = try eval(ctx, pos);
+            return strToUpper(a);
+        }, // UPPER
+        0x5B => {
+            const a = try eval(ctx, pos);
+            return strToLower(a);
+        }, // LOWER
+
+        // Type checks
+        0x60 => {
+            const v = try eval(ctx, pos);
+            return vBool(v.tag == TAG_STR);
+        }, // ISS
+        0x61 => {
+            const v = try eval(ctx, pos);
+            return vBool(v.tag == TAG_INT or v.tag == TAG_FLOAT);
+        }, // ISN
+        0x62 => {
+            const v = try eval(ctx, pos);
+            return vBool(v.tag == TAG_NULL);
+        }, // ISX
+        0x63 => {
+            const v = try eval(ctx, pos);
+            return vBool(v.tag == TAG_BOOL);
+        }, // ISB
+        0x64 => { // LNG: string len in [min, max]
+            const s = try eval(ctx, pos);
+            if (pos.* + 2 > ctx.bc.len) return EvalError.BadBytecode;
+            const mn = ctx.bc[pos.*];
+            pos.* += 1;
+            const mx = ctx.bc[pos.*];
+            pos.* += 1;
+            const l: u16 = if (s.tag == TAG_STR) s.slen else 0;
+            return vBool(l >= mn and l <= mx);
+        },
+
+        // LET(n, def, body)
+        0x70 => {
+            if (pos.* >= ctx.bc.len) return EvalError.BadBytecode;
+            const slot = ctx.bc[pos.*];
+            pos.* += 1;
+            if (slot >= MAX_LOCALS) return EvalError.BadBytecode;
+            const def = try eval(ctx, pos);
+            ctx.locals[slot] = def;
+            return eval(ctx, pos);
+        },
+
+        // IF(cond, then, else)
+        0x71 => {
+            const cond = try eval(ctx, pos);
+            const then_v = try eval(ctx, pos);
+            const else_v = try eval(ctx, pos);
+            return if (isTruthy(cond)) then_v else else_v;
+        },
+
+        // SEGR macro: 0x80 [u8 reg][u8 sep][u8 idx]
+        0x80 => {
+            if (pos.* + 3 > ctx.bc.len) return EvalError.BadBytecode;
+            const reg = ctx.bc[pos.*];
+            pos.* += 1;
+            const sep = ctx.bc[pos.*];
+            pos.* += 1;
+            const idx: i64 = ctx.bc[pos.*];
+            pos.* += 1;
+            const s = if (reg < 128) (if (reg < ctx.regs.len) ctx.regs[reg] else vNull()) else ctx.locals[reg - 128];
+            return strSeg(s, sep, idx);
+        },
+
+        // SEGRN macro: 0x81 [u8 reg][u8 sep][u8 idx] → TONUM(SEG(...))
+        0x81 => {
+            if (pos.* + 3 > ctx.bc.len) return EvalError.BadBytecode;
+            const reg = ctx.bc[pos.*];
+            pos.* += 1;
+            const sep = ctx.bc[pos.*];
+            pos.* += 1;
+            const idx: i64 = ctx.bc[pos.*];
+            pos.* += 1;
+            const s = if (reg < 128) (if (reg < ctx.regs.len) ctx.regs[reg] else vNull()) else ctx.locals[reg - 128];
+            const seg = strSeg(s, sep, idx);
+            if (seg.tag != TAG_STR) return vFloat(0);
+            return vFloat(parseF64(seg.s[0..seg.slen]));
+        },
+
+        else => return EvalError.UnknownOpcode,
+    }
+}
+
+// Static context — avoids putting the large Ctx (locals array) on the shadow stack
+var static_ctx: Ctx = Ctx{
+    .bc = &[_]u8{},
+    .regs = &[_]Value{},
+    .locals = [_]Value{Value{ .tag = TAG_NULL, .i = 0, .f = 0, .s = undefined, .slen = 0 }} ** MAX_LOCALS,
+    .depth = 0,
+};
+
+pub fn run(bc: []const u8, regs: []const Value) EvalError!bool {
+    if (bc.len < 2) return EvalError.BadBytecode;
+    if (bc[0] != 0x01) return EvalError.BadVersion;
+    // Reset static context
+    static_ctx.bc = bc;
+    static_ctx.regs = regs;
+    static_ctx.depth = 0;
+    for (0..MAX_LOCALS) |i| static_ctx.locals[i] = vNull();
+    var pos: usize = 1;
+    const result = try eval(&static_ctx, &pos);
+    return isTruthy(result);
+}

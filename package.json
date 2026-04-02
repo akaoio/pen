@@ -1,0 +1,12 @@
+{
+  "name": "@akaoio/pen",
+  "version": "0.1.0",
+  "description": "PEN — Predicate-Embedded Namespace. Tiny binary VM compiled to WASM.",
+  "main": "pen.js",
+  "scripts": {
+    "build": "node build.js",
+    "test": "node test/test.js"
+  },
+  "files": ["pen.js", "pen.wasm"],
+  "license": "MIT"
+}
