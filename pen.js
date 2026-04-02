@@ -1,9 +1,9 @@
-// pen.js — PEN WASM loader + JS API
-// Works in Node.js (v16+) and browser (ESM via pen.mjs or inline script).
+// pen.js — PEN WASM loader + bytecode builder (ES module)
+// Node.js 16+ and modern browsers.
 //
 // Usage:
-//   const pen = require('./pen')           // Node (CJS)
-//   await pen.ready                        // wait for WASM init
+//   import pen from '@akaoio/pen'
+//   await pen.ready
 //   const ok = pen.run(bytecode, regs)    // bytecode: Uint8Array, regs: any[]
 //
 // Register value types accepted:
@@ -13,42 +13,27 @@
 //   float             → tag 3 (F64)
 //   string            → tag 4 (STR utf8)
 
-;(function(root, factory) {
-  if (typeof module !== 'undefined') module.exports = factory()
-  else root.pen = factory()
-}(typeof globalThis !== 'undefined' ? globalThis : this, function() {
-
-var pen = {}
+const pen = {}
 
 // ── WASM init ────────────────────────────────────────────────────────────────
 
-var _wasm = null
-var _mem  = null  // Uint8Array view over WASM linear memory
+let _wasm = null
 
 function _view() {
-  // Refresh DataView each time (memory may grow)
   return new Uint8Array(_wasm.instance.exports.memory.buffer)
 }
 
-pen.ready = (function() {
-  var wasmPath
-  if (typeof __dirname !== 'undefined') {
-    // Node.js
-    wasmPath = require('path').join(__dirname, 'pen.wasm')
-    return require('fs').promises.readFile(wasmPath)
-      .then(function(buf) { return WebAssembly.instantiate(buf, {}) })
-      .then(function(result) { _wasm = result; _mem = _view() })
+pen.ready = (async () => {
+  const wasmUrl = new URL('./pen.wasm', import.meta.url)
+  let wasmBytes
+  if (typeof process !== 'undefined' && process.versions?.node) {
+    const { readFile } = await import('fs/promises')
+    wasmBytes = await readFile(wasmUrl)
   } else {
-    // Browser — expects pen.wasm in same directory as pen.js
-    var base = (typeof document !== 'undefined' && document.currentScript)
-      ? document.currentScript.src.replace(/pen\.js$/, '')
-      : './'
-    return fetch(base + 'pen.wasm')
-      .then(function(r) { return r.arrayBuffer() })
-      .then(function(buf) { return WebAssembly.instantiate(buf, {}) })
-      .then(function(result) { _wasm = result; _mem = _view() })
+    wasmBytes = await (await fetch(wasmUrl)).arrayBuffer()
   }
-}())
+  _wasm = await WebAssembly.instantiate(wasmBytes, {})
+})()
 
 // ── Wire encoding ─────────────────────────────────────────────────────────────
 // Layout written into the shared 64KB buffer:
@@ -57,18 +42,7 @@ pen.ready = (function() {
 //   [N+4..N+7] u32 LE  = register count
 //   [N+8..]    register wire encoding
 
-var _enc = (typeof TextEncoder !== 'undefined') ? new TextEncoder() : {
-  encode: function(s) {
-    var bytes = []
-    for (var i = 0; i < s.length; i++) {
-      var c = s.charCodeAt(i)
-      if (c < 0x80) bytes.push(c)
-      else if (c < 0x800) bytes.push(0xC0 | (c >> 6), 0x80 | (c & 0x3F))
-      else bytes.push(0xE0 | (c >> 12), 0x80 | ((c >> 6) & 0x3F), 0x80 | (c & 0x3F))
-    }
-    return new Uint8Array(bytes)
-  }
-}
+const _enc = new TextEncoder()
 
 function _writeReg(view, offset, val) {
   if (val === null || val === undefined) {
@@ -112,42 +86,39 @@ function _writeReg(view, offset, val) {
 
 pen.run = function(bytecode, regs) {
   if (!_wasm) throw new Error('pen: not ready. await pen.ready first.')
-  var exp = _wasm.instance.exports
-  var view = _view()
-
-  // Refresh in case memory grew
-  _mem = view
+  const exp = _wasm.instance.exports
+  const view = _view()
 
   // reset bump
   exp.free()
 
   // Get base address of the shared buffer inside WASM linear memory
-  var base = exp.mem()
+  const base = exp.mem()
 
   // Write bytecode length (u32 LE) at buf[0..3]
-  var bclen = bytecode.length
+  const bclen = bytecode.length
   view[base + 0] = bclen & 0xFF
   view[base + 1] = (bclen >> 8) & 0xFF
   view[base + 2] = (bclen >> 16) & 0xFF
   view[base + 3] = (bclen >> 24) & 0xFF
 
   // Write bytecode
-  for (var i = 0; i < bclen; i++) view[base + 4 + i] = bytecode[i]
+  for (let i = 0; i < bclen; i++) view[base + 4 + i] = bytecode[i]
 
   // Write register count (u32 LE)
-  var regOff = base + 4 + bclen
-  var nregs = regs ? regs.length : 0
+  const regOff = base + 4 + bclen
+  const nregs = regs ? regs.length : 0
   view[regOff + 0] = nregs & 0xFF
   view[regOff + 1] = (nregs >> 8) & 0xFF
   view[regOff + 2] = (nregs >> 16) & 0xFF
   view[regOff + 3] = (nregs >> 24) & 0xFF
 
   // Write registers
-  var off = regOff + 4
-  for (var j = 0; j < nregs; j++) off = _writeReg(view, off, regs[j])
+  let off = regOff + 4
+  for (let j = 0; j < nregs; j++) off = _writeReg(view, off, regs[j])
 
   // Execute
-  var result = exp.run()
+  const result = exp.run()
   if (result === 1) return true
   if (result === 0) return false
   if (result === -2) throw new Error('PEN: bad version byte')
@@ -254,10 +225,13 @@ bc.lng    = function(a,mn,mx){ return [0x64].concat(a, [mn, mx]) }
 
 bc.let_   = function(slot, def, body) { return [0x70, slot].concat(def, body) }
 bc.if_    = function(c,t,e) { return [0x71].concat(c, t, e) }
+bc.f64    = function(n) {  // F64 literal (big-endian 8 bytes)
+  var buf = new ArrayBuffer(8)
+  new DataView(buf).setFloat64(0, n, false /* big-endian */)
+  return [0x08].concat(Array.from(new Uint8Array(buf)))
+}
 
 bc.segr   = function(reg, sep, idx) { return [0x80, reg, sep.charCodeAt(0), idx] }
 bc.segrn  = function(reg, sep, idx) { return [0x81, reg, sep.charCodeAt(0), idx] }
 
-return pen
-
-}))
+export default pen

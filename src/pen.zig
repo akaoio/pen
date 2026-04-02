@@ -185,6 +185,16 @@ fn f64ToStr(f: f64, buf: []u8) usize {
         buf[2] = 'N';
         return 3;
     }
+    // Handle Infinity before @intFromFloat (which is UB on Inf)
+    if (f > 1.7976931348623157e+308 or f < -1.7976931348623157e+308) {
+        if (f > 0) {
+            buf[0] = 'I'; buf[1] = 'n'; buf[2] = 'f';
+            return 3;
+        } else {
+            buf[0] = '-'; buf[1] = 'I'; buf[2] = 'n'; buf[3] = 'f';
+            return 4;
+        }
+    }
     var val = f;
     var pos: usize = 0;
     if (val < 0) {
@@ -192,7 +202,27 @@ fn f64ToStr(f: f64, buf: []u8) usize {
         pos += 1;
         val = -val;
     }
-    // Integer part
+    // Safety threshold: i64 can only hold values up to ~9.22e18
+    // For larger floats use f64 digit extraction to avoid @intFromFloat UB
+    const I64_MAX_F64: f64 = 9.22337203685477e18;
+    if (val >= I64_MAX_F64) {
+        var n = @trunc(val);
+        var tmp2: [32]u8 = undefined;
+        var tlen2: usize = 0;
+        while (n >= 1.0 and tlen2 < 30) {
+            var digit = @mod(n, 10.0);
+            if (digit < 0.0) digit = 0.0;
+            if (digit > 9.0) digit = 9.0;
+            tmp2[tlen2] = @as(u8, @intFromFloat(digit)) + '0';
+            tlen2 += 1;
+            n = @trunc(n / 10.0);
+        }
+        if (tlen2 == 0) { tmp2[0] = '0'; tlen2 = 1; }
+        var j2: usize = tlen2;
+        while (j2 > 0) : (j2 -= 1) { buf[pos] = tmp2[j2 - 1]; pos += 1; }
+        return pos; // large floats have no meaningful fractional part
+    }
+    // Integer part (safe: val < I64_MAX_F64 ≤ i64.MAX)
     const ipart: i64 = @intFromFloat(val);
     const fpart: f64 = val - @as(f64, @floatFromInt(ipart));
     // Write integer part
@@ -242,6 +272,14 @@ fn intToStr(n: i64, buf: []u8) usize {
     if (n == 0) {
         buf[0] = '0';
         return 1;
+    }
+    // Special-case i64.MIN: -v would overflow (two's complement)
+    if (n == -9223372036854775808) {
+        // Write "-9223372036854775808" literally
+        const digits = [_]u8{ '-','9','2','2','3','3','7','2','0','3','6','8','5','4','7','7','5','8','0','8' };
+        var k: usize = 0;
+        while (k < digits.len) : (k += 1) buf[k] = digits[k];
+        return digits.len;
     }
     var tmp: [20]u8 = undefined;
     var tlen: usize = 0;
@@ -354,11 +392,13 @@ fn strSeg(s: Value, sep: u8, idx: i64) Value {
 // ULEB128 read
 fn readUleb(bc: []const u8, pos: *usize) u64 {
     var result: u64 = 0;
-    var shift: u6 = 0;
+    var shift: u7 = 0;
     while (pos.* < bc.len) {
         const b = bc[pos.*];
         pos.* += 1;
-        result |= @as(u64, b & 0x7F) << shift;
+        if (shift < 64) {
+            result |= @as(u64, b & 0x7F) << @intCast(shift);
+        }
         if ((b & 0x80) == 0) break;
         shift += 7;
     }
@@ -368,17 +408,19 @@ fn readUleb(bc: []const u8, pos: *usize) u64 {
 // SLEB128 read
 fn readSleb(bc: []const u8, pos: *usize) i64 {
     var result: i64 = 0;
-    var shift: u6 = 0;
+    var shift: u7 = 0;
     var b: u8 = 0;
     while (pos.* < bc.len) {
         b = bc[pos.*];
         pos.* += 1;
-        result |= @as(i64, b & 0x7F) << shift;
+        if (shift < 64) {
+            result |= @as(i64, b & 0x7F) << @intCast(shift);
+        }
         shift += 7;
         if ((b & 0x80) == 0) break;
     }
     if (shift < 64 and (b & 0x40) != 0) {
-        result |= -(@as(i64, 1) << shift);
+        result |= -(@as(i64, 1) << @intCast(shift));
     }
     return result;
 }
@@ -398,6 +440,109 @@ pub const Ctx = struct {
     locals: [MAX_LOCALS]Value,
     depth: u32,
 };
+
+// skipExpr — advance pos past one complete expression without evaluating it.
+// Used for short-circuit evaluation in AND, OR, and lazy IF branches.
+fn skipExpr(bc: []const u8, pos: *usize, depth: u32) EvalError!void {
+    if (depth == 0) return EvalError.MaxDepth;
+    if (pos.* >= bc.len) return EvalError.OutOfBounds;
+    const op = bc[pos.*];
+    pos.* += 1;
+
+    // Inline int shortcuts 0xE0..0xEF — no children
+    if (op >= 0xE0 and op <= 0xEF) return;
+    // Register shorthands 0xF0..0xF5 — no children
+    if (op >= 0xF0 and op <= 0xF5) return;
+    // Local shorthands 0xF8..0xFB — no children
+    if (op >= 0xF8 and op <= 0xFB) return;
+
+    switch (op) {
+        // Leaf opcodes — no children
+        0x00, 0x01, 0x02 => {},
+        0x23, 0x24 => {},
+
+        // STR: [u8 len] + len bytes
+        0x03 => {
+            if (pos.* >= bc.len) return EvalError.BadBytecode;
+            const len = bc[pos.*];
+            pos.* += 1;
+            if (pos.* + len > bc.len) return EvalError.BadBytecode;
+            pos.* += len;
+        },
+        // UINT (ULEB128): variable length
+        0x04 => { _ = readUleb(bc, pos); },
+        // INT (SLEB128): variable length
+        0x07 => { _ = readSleb(bc, pos); },
+        // F64: 8 bytes
+        0x08 => {
+            if (pos.* + 8 > bc.len) return EvalError.BadBytecode;
+            pos.* += 8;
+        },
+        // REG(n): 1 byte arg
+        0x10 => {
+            if (pos.* >= bc.len) return EvalError.BadBytecode;
+            pos.* += 1;
+        },
+        // AND(n) / OR(n): n children
+        0x20, 0x21 => {
+            if (pos.* >= bc.len) return EvalError.BadBytecode;
+            const n = bc[pos.*];
+            pos.* += 1;
+            var i: u8 = 0;
+            while (i < n) : (i += 1) try skipExpr(bc, pos, depth - 1);
+        },
+        // NOT, unary ops with 1 child
+        0x22, 0x46, 0x47, 0x50, 0x53, 0x54, 0x5A, 0x5B,
+        0x60, 0x61, 0x62, 0x63 => {
+            try skipExpr(bc, pos, depth - 1);
+        },
+        // Binary ops: 2 children
+        0x30, 0x31, 0x32, 0x33, 0x34, 0x35,
+        0x40, 0x41, 0x42, 0x43, 0x44, 0x45,
+        0x55, 0x56, 0x57, 0x58, 0x59 => {
+            try skipExpr(bc, pos, depth - 1);
+            try skipExpr(bc, pos, depth - 1);
+        },
+        // SLICE: 3 children
+        0x51 => {
+            try skipExpr(bc, pos, depth - 1);
+            try skipExpr(bc, pos, depth - 1);
+            try skipExpr(bc, pos, depth - 1);
+        },
+        // SEG: 1 child + 1 sep byte + 1 child
+        0x52 => {
+            try skipExpr(bc, pos, depth - 1);
+            if (pos.* >= bc.len) return EvalError.BadBytecode;
+            pos.* += 1; // sep byte
+            try skipExpr(bc, pos, depth - 1);
+        },
+        // LNG: 1 child + 2 literal bytes (min, max)
+        0x64 => {
+            try skipExpr(bc, pos, depth - 1);
+            if (pos.* + 2 > bc.len) return EvalError.BadBytecode;
+            pos.* += 2;
+        },
+        // LET(slot, def, body): 1 literal byte + 2 children
+        0x70 => {
+            if (pos.* >= bc.len) return EvalError.BadBytecode;
+            pos.* += 1; // slot
+            try skipExpr(bc, pos, depth - 1); // def
+            try skipExpr(bc, pos, depth - 1); // body
+        },
+        // IF(cond, then, else): 3 children
+        0x71 => {
+            try skipExpr(bc, pos, depth - 1);
+            try skipExpr(bc, pos, depth - 1);
+            try skipExpr(bc, pos, depth - 1);
+        },
+        // SEGR / SEGRN: 3 literal bytes
+        0x80, 0x81 => {
+            if (pos.* + 3 > bc.len) return EvalError.BadBytecode;
+            pos.* += 3;
+        },
+        else => return EvalError.UnknownOpcode,
+    }
+}
 
 pub fn eval(ctx: *Ctx, pos: *usize) EvalError!Value {
     if (ctx.depth >= MAX_DEPTH) return EvalError.MaxDepth;
@@ -438,8 +583,12 @@ pub fn eval(ctx: *Ctx, pos: *usize) EvalError!Value {
             return vStr(ctx.bc[start..].ptr, len);
         },
 
-        // UINT (ULEB128)
-        0x04 => return vInt(@intCast(readUleb(ctx.bc, pos))),
+        // UINT (ULEB128) — clamp to i64.MAX to avoid @intCast undefined behavior
+        0x04 => {
+            const u = readUleb(ctx.bc, pos);
+            const clamped: i64 = if (u > @as(u64, 9223372036854775807)) 9223372036854775807 else @intCast(u);
+            return vInt(clamped);
+        },
 
         // INT (SLEB128)
         0x07 => return vInt(readSleb(ctx.bc, pos)),
@@ -465,12 +614,16 @@ pub fn eval(ctx: *Ctx, pos: *usize) EvalError!Value {
             if (pos.* >= ctx.bc.len) return EvalError.BadBytecode;
             const n = ctx.bc[pos.*];
             pos.* += 1;
-            if (n >= 128) return ctx.locals[n - 128];
+            if (n >= 128) {
+                const li = @as(usize, n - 128);
+                if (li >= MAX_LOCALS) return vNull();
+                return ctx.locals[li];
+            }
             if (n >= ctx.regs.len) return vNull();
             return ctx.regs[n];
         },
 
-        // AND(n)
+        // AND(n) — short-circuit: skip remaining args on first false
         0x20 => {
             if (pos.* >= ctx.bc.len) return EvalError.BadBytecode;
             const n = ctx.bc[pos.*];
@@ -478,13 +631,17 @@ pub fn eval(ctx: *Ctx, pos: *usize) EvalError!Value {
             var ok = true;
             var i: u8 = 0;
             while (i < n) : (i += 1) {
-                const v = try eval(ctx, pos);
-                if (!isTruthy(v)) ok = false;
+                if (ok) {
+                    const v = try eval(ctx, pos);
+                    if (!isTruthy(v)) ok = false;
+                } else {
+                    try skipExpr(ctx.bc, pos, MAX_DEPTH - ctx.depth);
+                }
             }
             return vBool(ok);
         },
 
-        // OR(n)
+        // OR(n) — short-circuit: skip remaining args on first true
         0x21 => {
             if (pos.* >= ctx.bc.len) return EvalError.BadBytecode;
             const n = ctx.bc[pos.*];
@@ -492,8 +649,12 @@ pub fn eval(ctx: *Ctx, pos: *usize) EvalError!Value {
             var ok = false;
             var i: u8 = 0;
             while (i < n) : (i += 1) {
-                const v = try eval(ctx, pos);
-                if (isTruthy(v)) ok = true;
+                if (!ok) {
+                    const v = try eval(ctx, pos);
+                    if (isTruthy(v)) ok = true;
+                } else {
+                    try skipExpr(ctx.bc, pos, MAX_DEPTH - ctx.depth);
+                }
             }
             return vBool(ok);
         },
@@ -581,14 +742,20 @@ pub fn eval(ctx: *Ctx, pos: *usize) EvalError!Value {
             const b = try eval(ctx, pos);
             return vFloat(toNumber(a) / toNumber(b));
         },
-        0x46 => { // ABS
+        0x46 => { // ABS — special-case i64.MIN to avoid overflow
             const a = try eval(ctx, pos);
-            if (a.tag == TAG_INT) return vInt(if (a.i < 0) -a.i else a.i);
+            if (a.tag == TAG_INT) {
+                if (a.i == -9223372036854775808) return vFloat(9223372036854775808.0);
+                return vInt(if (a.i < 0) -a.i else a.i);
+            }
             return vFloat(@abs(toNumber(a)));
         },
-        0x47 => { // NEG
+        0x47 => { // NEG — special-case i64.MIN to avoid overflow
             const a = try eval(ctx, pos);
-            if (a.tag == TAG_INT) return vInt(-a.i);
+            if (a.tag == TAG_INT) {
+                if (a.i == -9223372036854775808) return vFloat(9223372036854775808.0);
+                return vInt(-a.i);
+            }
             return vFloat(-toNumber(a));
         },
 
@@ -598,25 +765,35 @@ pub fn eval(ctx: *Ctx, pos: *usize) EvalError!Value {
             const l: i64 = if (a.tag == TAG_STR) a.slen else 0;
             return vInt(l);
         },
-        0x51 => { // SLICE(str, start, end)
+        0x51 => { // SLICE(str, start, end) — clamp float indices to [0, MAX_STR]
             const s = try eval(ctx, pos);
             const st_v = try eval(ctx, pos);
             const en_v = try eval(ctx, pos);
             if (s.tag != TAG_STR) return vStr("", 0);
-            var st: usize = @intCast(@max(0, @as(i64, @intFromFloat(toNumber(st_v)))));
-            var en: usize = @intCast(@max(0, @as(i64, @intFromFloat(toNumber(en_v)))));
+            const MAX_F: f64 = @floatFromInt(MAX_STR);
+            var stf = toNumber(st_v);
+            var enf = toNumber(en_v);
+            if (stf != stf or stf < 0.0) stf = 0.0; // NaN or negative → 0
+            if (enf != enf or enf < 0.0) enf = 0.0;
+            if (stf > MAX_F) stf = MAX_F;
+            if (enf > MAX_F) enf = MAX_F;
+            var st: usize = @intFromFloat(stf);
+            var en: usize = @intFromFloat(enf);
             if (st > s.slen) st = s.slen;
             if (en > s.slen) en = s.slen;
             if (st > en) st = en;
             return vStr(s.s[st..].ptr, en - st);
         },
-        0x52 => { // SEG(str_expr, sep_byte, idx_expr)
+        0x52 => { // SEG(str_expr, sep_byte, idx_expr) — guard against NaN/huge idx
             const s = try eval(ctx, pos);
             if (pos.* >= ctx.bc.len) return EvalError.BadBytecode;
             const sep = ctx.bc[pos.*];
             pos.* += 1;
             const idx_v = try eval(ctx, pos);
-            const idx: i64 = @intFromFloat(toNumber(idx_v));
+            const idx_f = toNumber(idx_v);
+            // NaN or negative or impossibly large → no segment matches
+            if (idx_f != idx_f or idx_f < 0.0 or idx_f > @as(f64, MAX_STR)) return vStr("", 0);
+            const idx: i64 = @intFromFloat(idx_f);
             return strSeg(s, sep, idx);
         },
         0x53 => { // TONUM
@@ -644,23 +821,37 @@ pub fn eval(ctx: *Ctx, pos: *usize) EvalError!Value {
                 else => return vStr("null", 4),
             }
         },
-        0x55 => { // CONCAT
-            const a = try eval(ctx, pos);
-            const b = try eval(ctx, pos);
-            if (a.tag == TAG_STR and b.tag == TAG_STR) {
-                var r: Value = undefined;
-                r.tag = TAG_STR;
-                r.i = 0;
-                r.f = 0;
-                const total = @min(a.slen + b.slen, MAX_STR);
-                var k: usize = 0;
-                while (k < a.slen and k < total) : (k += 1) r.s[k] = a.s[k];
-                var j: usize = 0;
-                while (j < b.slen and k + j < total) : (j += 1) r.s[k + j] = b.s[j];
-                r.slen = @intCast(total);
-                return r;
-            }
-            return vStr("", 0);
+        0x55 => { // CONCAT — coerce non-strings via TOSTR then concatenate
+            const a_raw = try eval(ctx, pos);
+            const b_raw = try eval(ctx, pos);
+            // coerce each operand to string
+            var as_buf: [32]u8 = undefined;
+            var bs_buf: [32]u8 = undefined;
+            const a: Value = switch (a_raw.tag) {
+                TAG_STR => a_raw,
+                TAG_INT => blk: { const l = intToStr(a_raw.i, &as_buf); break :blk vStr(&as_buf, l); },
+                TAG_FLOAT => blk: { const l = f64ToStr(a_raw.f, &as_buf); break :blk vStr(&as_buf, l); },
+                TAG_BOOL => if (a_raw.i != 0) vStr("true", 4) else vStr("false", 5),
+                else => vStr("null", 4),
+            };
+            const b: Value = switch (b_raw.tag) {
+                TAG_STR => b_raw,
+                TAG_INT => blk: { const l = intToStr(b_raw.i, &bs_buf); break :blk vStr(&bs_buf, l); },
+                TAG_FLOAT => blk: { const l = f64ToStr(b_raw.f, &bs_buf); break :blk vStr(&bs_buf, l); },
+                TAG_BOOL => if (b_raw.i != 0) vStr("true", 4) else vStr("false", 5),
+                else => vStr("null", 4),
+            };
+            var r: Value = undefined;
+            r.tag = TAG_STR;
+            r.i = 0;
+            r.f = 0;
+            const total = @min(@as(usize, a.slen) + @as(usize, b.slen), MAX_STR);
+            var k: usize = 0;
+            while (k < a.slen and k < total) : (k += 1) r.s[k] = a.s[k];
+            var j: usize = 0;
+            while (j < b.slen and k + j < total) : (j += 1) r.s[k + j] = b.s[j];
+            r.slen = @intCast(total);
+            return r;
         },
         0x56 => {
             const a = try eval(ctx, pos);
@@ -708,15 +899,15 @@ pub fn eval(ctx: *Ctx, pos: *usize) EvalError!Value {
             const v = try eval(ctx, pos);
             return vBool(v.tag == TAG_BOOL);
         }, // ISB
-        0x64 => { // LNG: string len in [min, max]
+        0x64 => { // LNG: string len in [min, max] — non-string always fails
             const s = try eval(ctx, pos);
             if (pos.* + 2 > ctx.bc.len) return EvalError.BadBytecode;
             const mn = ctx.bc[pos.*];
             pos.* += 1;
             const mx = ctx.bc[pos.*];
             pos.* += 1;
-            const l: u16 = if (s.tag == TAG_STR) s.slen else 0;
-            return vBool(l >= mn and l <= mx);
+            if (s.tag != TAG_STR) return vBool(false);
+            return vBool(s.slen >= mn and s.slen <= mx);
         },
 
         // LET(n, def, body)
@@ -730,12 +921,17 @@ pub fn eval(ctx: *Ctx, pos: *usize) EvalError!Value {
             return eval(ctx, pos);
         },
 
-        // IF(cond, then, else)
+        // IF(cond, then, else) — lazy: only evaluate the taken branch
         0x71 => {
             const cond = try eval(ctx, pos);
-            const then_v = try eval(ctx, pos);
-            const else_v = try eval(ctx, pos);
-            return if (isTruthy(cond)) then_v else else_v;
+            if (isTruthy(cond)) {
+                const then_v = try eval(ctx, pos);
+                try skipExpr(ctx.bc, pos, MAX_DEPTH - ctx.depth);
+                return then_v;
+            } else {
+                try skipExpr(ctx.bc, pos, MAX_DEPTH - ctx.depth);
+                return eval(ctx, pos);
+            }
         },
 
         // SEGR macro: 0x80 [u8 reg][u8 sep][u8 idx]
@@ -747,7 +943,12 @@ pub fn eval(ctx: *Ctx, pos: *usize) EvalError!Value {
             pos.* += 1;
             const idx: i64 = ctx.bc[pos.*];
             pos.* += 1;
-            const s = if (reg < 128) (if (reg < ctx.regs.len) ctx.regs[reg] else vNull()) else ctx.locals[reg - 128];
+            const s = if (reg < 128)
+                (if (reg < ctx.regs.len) ctx.regs[reg] else vNull())
+            else if (reg - 128 < MAX_LOCALS)
+                ctx.locals[reg - 128]
+            else
+                vNull();
             return strSeg(s, sep, idx);
         },
 
@@ -760,7 +961,12 @@ pub fn eval(ctx: *Ctx, pos: *usize) EvalError!Value {
             pos.* += 1;
             const idx: i64 = ctx.bc[pos.*];
             pos.* += 1;
-            const s = if (reg < 128) (if (reg < ctx.regs.len) ctx.regs[reg] else vNull()) else ctx.locals[reg - 128];
+            const s = if (reg < 128)
+                (if (reg < ctx.regs.len) ctx.regs[reg] else vNull())
+            else if (reg - 128 < MAX_LOCALS)
+                ctx.locals[reg - 128]
+            else
+                vNull();
             const seg = strSeg(s, sep, idx);
             if (seg.tag != TAG_STR) return vFloat(0);
             return vFloat(parseF64(seg.s[0..seg.slen]));

@@ -1,5 +1,6 @@
 {
   "name": "@akaoio/pen",
+  "type": "module",
   "version": "0.1.0",
   "description": "PEN — Predicate-Embedded Namespace. Tiny binary VM compiled to WASM.",
   "main": "pen.js",

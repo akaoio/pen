@@ -2,7 +2,7 @@
 // Run with: node test/test.js
 // Tests every opcode, edge case, adversarial input, and candle-like use case.
 
-const pen = require('../pen')
+import pen from '../pen.js'
 const b = pen.bc
 
 var passed = 0
@@ -363,6 +363,228 @@ pen.ready.then(function() {
   var longStr2 = 'x'.repeat(200)
   assert('LNG truncated', run(b.lng(b.str(longStr2), 1, 128)), true)
 
+  // ── Edge case tests (remaining dangerous scenarios) ─────────────────────
+  console.log('\n[edge cases]')
+
+  // Edge A: f64ToStr large finite float (val > i64.MAX ≈ 9.2e18)
+  // @intFromFloat(1e20) into i64 is UB → should not crash/produce garbage
+  assert('edgeA f64ToStr 9e18 exact', run(b.eq(b.tostr(b.f64(9e18)), b.str('9000000000000000000'))), true)
+  assert('edgeA f64ToStr 1e20 no crash', (function() {
+    try { return run(b.lng(b.tostr(b.f64(1e20)), 1, 30)) }
+    catch(e) { return false }
+  })(), true)
+  assert('edgeA f64ToStr 1e50 no crash', (function() {
+    try { return run(b.iss(b.tostr(b.f64(1e50)))) }
+    catch(e) { return false }
+  })(), true)
+
+  // Edge B: SLICE with large float indices
+  assert('edgeB SLICE large float', (function() {
+    try { return run(b.eq(b.slice(b.str('hello'), b.f64(1e30), b.f64(1e30)), b.str(''))) }
+    catch(e) { return 'threw:' + e.message }
+  })(), true)
+  assert('edgeB SLICE NaN start', (function() {
+    try {
+      var nan = [0x45].concat(b.uint(0), b.uint(0))  // DIVF(0,0) = NaN
+      // SLICE("hello", NaN, 5) → NaN clamped to 0 → slice [0,5] = "hello"
+      return run([0x60, 0x51].concat(b.str('hello'), nan, b.uint(5)))  // ISS(SLICE(...))
+    } catch(e) { return 'threw:' + e.message }
+  })(), true)
+  assert('edgeB SLICE negative large', (function() {
+    try { return run(b.eq(b.slice(b.str('hello'), b.f64(-1e30), b.f64(-1e30)), b.str(''))) }
+    catch(e) { return 'threw:' + e.message }
+  })(), true)
+
+  // Edge C: SEG with large/NaN float index → ""
+  assert('edgeC SEG large float idx', (function() {
+    try { return run(b.eq(b.seg(b.str('a_b_c'), '_', b.f64(1e30)), b.str(''))) }
+    catch(e) { return 'threw:' + e.message }
+  })(), true)
+  assert('edgeC SEG NaN idx', (function() {
+    try {
+      var nan = [0x45].concat(b.uint(0), b.uint(0))  // DIVF(0,0) = NaN
+      // SEG with NaN idx → "" (NaN treated as out-of-range)
+      return run([0x60, 0x52].concat(b.str('a_b_c'), [95], nan))  // ISS(SEG(...)) → true (returns "")
+    } catch(e) { return 'threw:' + e.message }
+  })(), true)
+
+  // Edge D: skipExpr depth bomb — deeply nested skipped branch must not stack-overflow
+  assert('edgeD skipExpr depth bomb', (function() {
+    function deepAnd(n) {
+      if (n === 0) return b.pass()
+      return b.and([b.false_(), deepAnd(n - 1)])
+    }
+    try {
+      pen.run(b.prog(deepAnd(200)), [])
+      return false  // must throw MaxDepth, not succeed
+    } catch(e) {
+      return e.message.includes('max recursion')
+    }
+  })(), true)
+
+  // Edge E: ABS(i64.MIN) — overflow: -i64.MIN = i64.MIN in two's complement
+  assert('edgeE ABS i64.MIN positive', (function() {
+    try {
+      var i64min_sleb = [0x07, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x7F]
+      return run([0x33, 0x46].concat(i64min_sleb).concat(b.uint(0)))  // GT(ABS(i64.MIN), 0)
+    } catch(e) { return 'threw:' + e.message }
+  })(), true)
+
+  // Edge F: NEG(i64.MIN) — same overflow
+  assert('edgeF NEG i64.MIN positive', (function() {
+    try {
+      var i64min_sleb = [0x07, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x7F]
+      return run([0x33, 0x47].concat(i64min_sleb).concat(b.uint(0)))  // GT(NEG(i64.MIN), 0)
+    } catch(e) { return 'threw:' + e.message }
+  })(), true)
+
+  // Edge G: UINT > i64.MAX — must not crash in any build mode
+  assert('edgeG UINT u64.MAX no crash', (function() {
+    try {
+      var u64max = [0x04, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x01]
+      pen.run(b.prog(u64max), [])
+      return true
+    } catch(e) { return e.message.includes('runtime error') ? false : true }
+  })(), true)
+
+  // ── Bug regression tests ──────────────────────────────────────────────────
+  // These tests EXPOSE known bugs. They FAIL on buggy builds and PASS after fixes.
+  console.log('\n[bugs]')
+
+  // Bug #1: IF evaluates both branches (no lazy eval)
+  // IF(false, DIVU(1,0), PASS) — with lazy eval: skips then-branch, evaluates else=PASS → true
+  assert('bug#1 IF lazy else', (function() {
+    try { return run(b.if_(b.false_(), b.divu(b.uint(1), b.uint(0)), b.pass())) }
+    catch(e) { return 'threw:' + e.message }
+  })(), true)
+  // IF(true, PASS, DIVU(1,0)) — with lazy eval: skips else-branch, evaluates then=PASS → true
+  assert('bug#1 IF lazy then', (function() {
+    try { return run(b.if_(b.true_(), b.pass(), b.divu(b.uint(1), b.uint(0)))) }
+    catch(e) { return 'threw:' + e.message }
+  })(), true)
+
+  // Bug #2: AND no short-circuit (evaluates all args even after false)
+  // AND(false, DIVU(1,0)) should return false (not throw)
+  assert('bug#2 AND short-circuit', (function() {
+    try { return run(b.and([b.false_(), b.divu(b.uint(1), b.uint(0))])) }
+    catch(e) { return 'threw:' + e.message }
+  })(), false)
+  // OR(true, DIVU(1,0)) should return true (not throw)
+  assert('bug#2 OR short-circuit', (function() {
+    try { return run(b.or([b.true_(), b.divu(b.uint(1), b.uint(0))])) }
+    catch(e) { return 'threw:' + e.message }
+  })(), true)
+
+  // Bug #3: SEGR/REG locals out-of-bounds
+  // REG(128+32) accesses locals[32] which is out of bounds (MAX_LOCALS=32)
+  // Should return null, not crash/garbage
+  assert('bug#3 REG local oob → null', (function() {
+    try {
+      // 0x10 [160] = REG(128+32) → locals[32] OOB → vNull()
+      return pen.run(b.prog([0x62, 0x10, 160]), [])  // ISX(REG(160)) → ISX(null) → true
+    } catch(e) { return 'threw:' + e.message }
+  })(), true)
+
+  // SEGR with local reg index ≥ MAX_LOCALS — gets vNull from OOB guard, strSeg returns ""
+  // ISX("") = false (empty string, not null), so the right check is ISS (is string)
+  assert('bug#3 SEGR local oob → empty str', (function() {
+    try {
+      // 0x80 [160, '_', 0] = SEGR(local[32], '_', 0) → strSeg(null,...) → "" (TAG_STR)
+      return pen.run(b.prog([0x60, 0x80, 160, 95, 0]), [])  // ISS(SEGR(...)) → true (is string "")
+    } catch(e) { return 'threw:' + e.message }
+  })(), true)
+
+  // Bug #4: intToStr i64.MIN overflow
+  // -(-9223372036854775808) = -9223372036854775808 in two's complement overflow
+  // EQ(TOSTR(i64.MIN), STR("-9223372036854775808")) should be true
+  assert('bug#4 intToStr i64.MIN', (function() {
+    try {
+      // i64.MIN via SLEB128: 0x80 0x80 0x80 0x80 0x80 0x80 0x80 0x80 0x80 0x7F (10 bytes)
+      var i64min_sleb = [0x07, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x7F]
+      // EQ(TOSTR(i64.MIN), STR("-9223372036854775808"))
+      return run([0x30, 0x54].concat(i64min_sleb).concat(b.str('-9223372036854775808')))
+    } catch(e) { return 'threw:' + e.message }
+  })(), true)
+
+  // Bug #5: f64ToStr Infinity undefined behavior
+  // TOSTR(DIVF(1, 0)) should equal "Inf" not crash or produce garbage
+  assert('bug#5 f64ToStr +Inf', (function() {
+    try {
+      // EQ(TOSTR(DIVF(1,0)), STR("Inf"))
+      return run([0x30, 0x54, 0x45].concat(b.uint(1), b.uint(0)).concat(b.str('Inf')))
+    } catch(e) { return 'threw:' + e.message }
+  })(), true)
+  // -Inf: TOSTR(DIVF(-1, 1)) ... actually DIVF(-1,0)
+  assert('bug#5 f64ToStr -Inf', (function() {
+    try {
+      // NEG(DIVF(1,0)) = -Inf; EQ(TOSTR(-Inf), STR("-Inf"))
+      return run([0x30, 0x54, 0x47, 0x45].concat(b.uint(1), b.uint(0)).concat(b.str('-Inf')))
+    } catch(e) { return 'threw:' + e.message }
+  })(), true)
+
+  // Bug #6: ULEB128 shift overflow (shift: u6 wraps at ≥64)
+  // A 10-byte ULEB128 has shift reaching 63 on byte 9 then +7 = 70 which wraps to 6
+  // Construct a pathological ULEB: 10 continuation bytes
+  assert('bug#6 ULEB128 shift overflow no UB', (function() {
+    try {
+      // 10 bytes of 0x81 (continuation) then 0x00: oversized ULEB
+      // Should not crash or produce wildly wrong result
+      var oversized = [0x04, 0x81, 0x81, 0x81, 0x81, 0x81, 0x81, 0x81, 0x81, 0x81, 0x00]
+      // Just must not throw/crash
+      pen.run(b.prog(oversized), [])
+      return true
+    } catch(e) {
+      // BadBytecode is acceptable — crash/UB is not
+      return e.message.includes('runtime error') ? false : true
+    }
+  })(), true)
+
+  // Bug #7: @intCast(u64 → i64) can panic on values > i64.MAX
+  // UINT with value = 2^63 (i64.MAX+1) encodes as u64 but @intCast to i64 wraps/panics
+  assert('bug#7 UINT i64.MAX+1 no panic', (function() {
+    try {
+      // 2^63 = 9223372036854775808 in ULEB128 (9 bytes)
+      // 0x80 0x80 0x80 0x80 0x80 0x80 0x80 0x80 0x80 0x01
+      var bc2 = [0x04, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x01]
+      pen.run(b.prog(bc2), [])
+      return true
+    } catch(e) {
+      return e.message.includes('runtime error') ? false : true
+    }
+  })(), true)
+
+  // Bug #9: TONUM type inconsistency — str→vFloat, int→vInt causes ISN to differ
+  // TONUM("42") should be numeric; ISN(TONUM("42")) = true
+  assert('bug#9 TONUM str is numeric', run(b.isn(b.tonum(b.str('42')))), true)
+  // The inconsistency: TONUM("42") returns vFloat but TONUM(42) returns vInt
+  // They should compare equal
+  assert('bug#9 TONUM("42") eq TONUM(42)', run(b.eq(b.tonum(b.str('42')), b.tonum(b.uint(42)))), true)
+
+  // Bug #11: LNG(null, 0, 5) → should be false (null is not a string)
+  // l = if (s.tag == TAG_STR) s.slen else 0  → 0 >= 0 → true  (BUG: should be false for non-string)
+  assert('bug#11 LNG null 0 5 → false', run(b.lng(b.null_(), 0, 5)), false)
+
+  // Bug #12: CONCAT non-string → should coerce or signal, not silently return ""
+  // CONCAT(42, "bar") → "42bar" or at minimum not silently discard
+  // Current behavior: returns "" because a.tag != TAG_STR
+  assert('bug#12 CONCAT int+str → coerce', (function() {
+    var result = run(b.eq(b.concat(b.uint(42), b.str('bar')), b.str('42bar')))
+    return result
+  })(), true)
+
+  // Bug #13: SLICE with NaN indices (fromFloat(NaN))
+  // SLICE(str, DIVF(0,0), DIVF(0,0)) — NaN as slice bounds
+  assert('bug#13 SLICE NaN indices safe', (function() {
+    try {
+      // DIVF(0,0) = NaN; SLICE("hello", NaN, NaN) must not UB/crash
+      var nanExpr = [0x45].concat(b.uint(0), b.uint(0))  // DIVF(0,0) = NaN
+      run([0x51].concat(b.str('hello'), nanExpr, nanExpr))
+      return true
+    } catch(e) {
+      return e.message.includes('runtime error') ? false : true
+    }
+  })(), true)
+
   // ── Print summary ─────────────────────────────────────────────────────────
   console.log('\n')
   console.log('─'.repeat(50))
@@ -372,12 +594,11 @@ pen.ready.then(function() {
     errors.forEach(function(e) {
       console.log('  FAIL [' + e.name + '] got=' + JSON.stringify(e.got) + ' expected=' + JSON.stringify(e.expected))
     })
-    process.exit(1)
+    process.exitCode = 1
   } else {
     console.log('\nAll tests passed.')
-    process.exit(0)
   }
 }).catch(function(e) {
   console.error('WASM load failed:', e)
-  process.exit(1)
+  process.exitCode = 1
 })
