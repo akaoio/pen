@@ -188,10 +188,15 @@ fn f64ToStr(f: f64, buf: []u8) usize {
     // Handle Infinity before @intFromFloat (which is UB on Inf)
     if (f > 1.7976931348623157e+308 or f < -1.7976931348623157e+308) {
         if (f > 0) {
-            buf[0] = 'I'; buf[1] = 'n'; buf[2] = 'f';
+            buf[0] = 'I';
+            buf[1] = 'n';
+            buf[2] = 'f';
             return 3;
         } else {
-            buf[0] = '-'; buf[1] = 'I'; buf[2] = 'n'; buf[3] = 'f';
+            buf[0] = '-';
+            buf[1] = 'I';
+            buf[2] = 'n';
+            buf[3] = 'f';
             return 4;
         }
     }
@@ -217,9 +222,15 @@ fn f64ToStr(f: f64, buf: []u8) usize {
             tlen2 += 1;
             n = @trunc(n / 10.0);
         }
-        if (tlen2 == 0) { tmp2[0] = '0'; tlen2 = 1; }
+        if (tlen2 == 0) {
+            tmp2[0] = '0';
+            tlen2 = 1;
+        }
         var j2: usize = tlen2;
-        while (j2 > 0) : (j2 -= 1) { buf[pos] = tmp2[j2 - 1]; pos += 1; }
+        while (j2 > 0) : (j2 -= 1) {
+            buf[pos] = tmp2[j2 - 1];
+            pos += 1;
+        }
         return pos; // large floats have no meaningful fractional part
     }
     // Integer part (safe: val < I64_MAX_F64 ≤ i64.MAX)
@@ -276,7 +287,7 @@ fn intToStr(n: i64, buf: []u8) usize {
     // Special-case i64.MIN: -v would overflow (two's complement)
     if (n == -9223372036854775808) {
         // Write "-9223372036854775808" literally
-        const digits = [_]u8{ '-','9','2','2','3','3','7','2','0','3','6','8','5','4','7','7','5','8','0','8' };
+        const digits = [_]u8{ '-', '9', '2', '2', '3', '3', '7', '2', '0', '3', '6', '8', '5', '4', '7', '7', '5', '8', '0', '8' };
         var k: usize = 0;
         while (k < digits.len) : (k += 1) buf[k] = digits[k];
         return digits.len;
@@ -470,9 +481,13 @@ fn skipExpr(bc: []const u8, pos: *usize, depth: u32) EvalError!void {
             pos.* += len;
         },
         // UINT (ULEB128): variable length
-        0x04 => { _ = readUleb(bc, pos); },
+        0x04 => {
+            _ = readUleb(bc, pos);
+        },
         // INT (SLEB128): variable length
-        0x07 => { _ = readSleb(bc, pos); },
+        0x07 => {
+            _ = readSleb(bc, pos);
+        },
         // F64: 8 bytes
         0x08 => {
             if (pos.* + 8 > bc.len) return EvalError.BadBytecode;
@@ -492,14 +507,11 @@ fn skipExpr(bc: []const u8, pos: *usize, depth: u32) EvalError!void {
             while (i < n) : (i += 1) try skipExpr(bc, pos, depth - 1);
         },
         // NOT, unary ops with 1 child
-        0x22, 0x46, 0x47, 0x50, 0x53, 0x54, 0x5A, 0x5B,
-        0x60, 0x61, 0x62, 0x63 => {
+        0x22, 0x46, 0x47, 0x50, 0x53, 0x54, 0x5A, 0x5B, 0x60, 0x61, 0x62, 0x63 => {
             try skipExpr(bc, pos, depth - 1);
         },
         // Binary ops: 2 children
-        0x30, 0x31, 0x32, 0x33, 0x34, 0x35,
-        0x40, 0x41, 0x42, 0x43, 0x44, 0x45,
-        0x55, 0x56, 0x57, 0x58, 0x59 => {
+        0x30, 0x31, 0x32, 0x33, 0x34, 0x35, 0x40, 0x41, 0x42, 0x43, 0x44, 0x45, 0x55, 0x56, 0x57, 0x58, 0x59 => {
             try skipExpr(bc, pos, depth - 1);
             try skipExpr(bc, pos, depth - 1);
         },
@@ -829,15 +841,27 @@ pub fn eval(ctx: *Ctx, pos: *usize) EvalError!Value {
             var bs_buf: [32]u8 = undefined;
             const a: Value = switch (a_raw.tag) {
                 TAG_STR => a_raw,
-                TAG_INT => blk: { const l = intToStr(a_raw.i, &as_buf); break :blk vStr(&as_buf, l); },
-                TAG_FLOAT => blk: { const l = f64ToStr(a_raw.f, &as_buf); break :blk vStr(&as_buf, l); },
+                TAG_INT => blk: {
+                    const l = intToStr(a_raw.i, &as_buf);
+                    break :blk vStr(&as_buf, l);
+                },
+                TAG_FLOAT => blk: {
+                    const l = f64ToStr(a_raw.f, &as_buf);
+                    break :blk vStr(&as_buf, l);
+                },
                 TAG_BOOL => if (a_raw.i != 0) vStr("true", 4) else vStr("false", 5),
                 else => vStr("null", 4),
             };
             const b: Value = switch (b_raw.tag) {
                 TAG_STR => b_raw,
-                TAG_INT => blk: { const l = intToStr(b_raw.i, &bs_buf); break :blk vStr(&bs_buf, l); },
-                TAG_FLOAT => blk: { const l = f64ToStr(b_raw.f, &bs_buf); break :blk vStr(&bs_buf, l); },
+                TAG_INT => blk: {
+                    const l = intToStr(b_raw.i, &bs_buf);
+                    break :blk vStr(&bs_buf, l);
+                },
+                TAG_FLOAT => blk: {
+                    const l = f64ToStr(b_raw.f, &bs_buf);
+                    break :blk vStr(&bs_buf, l);
+                },
                 TAG_BOOL => if (b_raw.i != 0) vStr("true", 4) else vStr("false", 5),
                 else => vStr("null", 4),
             };
